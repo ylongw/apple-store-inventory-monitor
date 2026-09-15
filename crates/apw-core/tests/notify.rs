@@ -336,6 +336,10 @@ async fn bark服务器不应答时会超时而不是永远挂着() {
     assert!(elapsed < Duration::from_secs(3), "实际耗时 {elapsed:?}");
     assert_eq!(err.channel(), Some("Bark"));
     assert!(matches!(err, NotifyError::Transport { .. }), "{err}");
+    assert!(
+        !err.to_string().contains(&server.base_url()),
+        "错误日志不得包含 Bark 地址"
+    );
     assert_eq!(server.count(), 1, "请求确实发出去了，只是没人应答");
 }
 

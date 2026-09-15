@@ -726,7 +726,16 @@ fn open_target_product(app: AppHandle, target: Target) -> Result<(), String> {
         .map_err(|e| e.to_string())
 }
 
-/// 手动测试提醒和首个目标的跳转，便于提前验证实际操作链路。
+/// 环境变量中的 Bark 地址优先，且不写入持久化设置。
+fn effective_bark_url(configured: &str) -> String {
+    ["BARK_API_URL", "BARK_API", "BARK_URL"]
+        .into_iter()
+        .filter_map(|name| std::env::var(name).ok())
+        .map(|value| value.trim().to_owned())
+        .find(|value| !value.is_empty())
+        .unwrap_or_else(|| configured.to_owned())
+}
+
 #[tauri::command]
 async fn test_notify(app: AppHandle) -> Result<(), String> {
     let settings = app.state::<AppState>().settings_snapshot();
@@ -734,6 +743,7 @@ async fn test_notify(app: AppHandle) -> Result<(), String> {
         || settings.bark_url.as_str(),
         |target| settings.bark_url_for(target),
     );
+    let bark_url = effective_bark_url(bark_url);
     if !settings.sound_enabled
         && bark_url.trim().is_empty()
         && settings.open_on_hit == OpenOnHit::None
@@ -785,7 +795,7 @@ async fn test_notify(app: AppHandle) -> Result<(), String> {
             .open_url(url, None::<&str>)
             .map_err(|e| e.to_string())?;
     }
-    dispatch_notification(&app, notification, bark_url)
+    dispatch_notification(&app, notification, &bark_url)
         .await
         .map_err(|e| e.to_string())
 }
@@ -845,6 +855,9 @@ fn in_stock_notification_body(target: &Target) -> String {
 /// 消费引擎事件：转发给前端，并在有货时发提醒。
 async fn pump_events(app: AppHandle, mut events: tokio::sync::mpsc::Receiver<Event>) {
     while let Some(event) = events.recv().await {
+        if std::env::var("APW_LOG_EVENTS").as_deref() == Ok("1") {
+            eprintln!("{}", serde_json::to_string(&event).unwrap_or_default());
+        }
         // 先原样转发。前端拿到的事件流应当与引擎发出的完全一致，
         // 中间少一层可能出错的翻译。
         let _ = app.emit(EVENT_CHANNEL, &event);
@@ -856,7 +869,7 @@ async fn pump_events(app: AppHandle, mut events: tokio::sync::mpsc::Receiver<Eve
                 .map(|s| s.settings_snapshot())
                 .unwrap_or_default();
             let destination_url = target_open_url(&app, target, settings.open_on_hit);
-            let bark_url = settings.bark_url_for(target).to_owned();
+            let bark_url = effective_bark_url(settings.bark_url_for(target));
             let has_product_bark = settings.product_bark_urls.contains_key(&target.part_number);
             let mut notification = Notification::new("有货了", in_stock_notification_body(target));
             if let Some(url) = &destination_url {
@@ -892,6 +905,7 @@ async fn pump_events(app: AppHandle, mut events: tokio::sync::mpsc::Receiver<Eve
             }
 
             if let Err(err) = dispatch_notification(&app, notification, &bark_url).await {
+                eprintln!("发送提醒时出错：{err}");
                 // 提醒没发出去是遗憾，但绝不能让监控本身停下来。
                 let _ = app.emit(NOTICE_CHANNEL, format!("发送提醒时出错：{err}"));
             } else {
@@ -916,6 +930,11 @@ async fn pump_events(app: AppHandle, mut events: tokio::sync::mpsc::Receiver<Eve
                 if actions.is_empty() {
                     continue;
                 }
+                eprintln!(
+                    "到货提醒已执行：{}（{}）",
+                    target.store_title,
+                    actions.join("、")
+                );
                 let _ = app.emit(
                     NOTICE_CHANNEL,
                     format!(
@@ -1082,6 +1101,9 @@ pub fn run() {
                 tauri::async_runtime::spawn(async move {
                     watcher.set_targets(targets).await;
                     watcher.set_interval(interval).await;
+                    if std::env::var("APW_AUTO_START").as_deref() == Ok("1") {
+                        watcher.start().await;
+                    }
                 });
             }
 
@@ -1154,6 +1176,33 @@ mod tests {
         parse_watch_band_sizes,
     };
     use apw_core::model::Target;
+
+    #[test]
+    fn bark_environment_override() {
+        if let Ok(expected) = std::env::var("APW_EXPECT_BARK") {
+            assert_eq!(super::effective_bark_url("configured"), expected);
+            return;
+        }
+        // 每个用例独立进程，避免修改并行测试共享的环境变量。
+        for (values, expected) in [
+            (["", "", ""], "configured"),
+            ([" primary ", "secondary", "third"], "primary"),
+            (["  ", "secondary", "third"], "secondary"),
+            (["", "", "third"], "third"),
+        ] {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "tests::bark_environment_override"])
+                .envs(
+                    ["BARK_API_URL", "BARK_API", "BARK_URL"]
+                        .into_iter()
+                        .zip(values),
+                )
+                .env("APW_EXPECT_BARK", expected)
+                .status()
+                .unwrap();
+            assert!(status.success());
+        }
+    }
 
     #[test]
     fn apple地区响应过滤占位项并保留三级选项() {

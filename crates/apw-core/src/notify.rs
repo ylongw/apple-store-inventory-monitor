@@ -231,7 +231,7 @@ impl Notifier for Bark {
             .await
             .map_err(|e| NotifyError::Transport {
                 channel: BARK.to_string(),
-                detail: e.to_string(),
+                detail: e.without_url().to_string(),
             })?;
 
         let status = resp.status();
