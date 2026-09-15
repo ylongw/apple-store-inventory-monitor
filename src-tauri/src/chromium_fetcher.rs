@@ -36,6 +36,7 @@ const MAX_RESPONSE_BYTES: usize = 4 << 20;
 const FALLBACK_CHROMIUM_MAJOR: u32 = 152;
 const MAX_EXCEPTION_SUMMARY_CHARS: usize = 160;
 const DELIVERY_CACHE_TTL: Duration = Duration::from_secs(60);
+const REGION_COOLDOWN: Duration = Duration::from_secs(5 * 60);
 
 type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
@@ -286,11 +287,24 @@ impl ChromiumSession {
         }
         self.last_inventory_request = Some(Instant::now());
 
+        if std::env::var("APW_LOG_EVENTS").as_deref() == Ok("1") {
+            eprintln!(
+                "Apple 库存请求：{} / {} / {} 个型号（附近门店）",
+                region.locale,
+                store_number,
+                parts.len()
+            );
+        }
+
         let mut pairs = vec![
             ("fae".to_string(), "true".to_string()),
             ("pl".to_string(), "true".to_string()),
             ("mts.0".to_string(), "regular".to_string()),
         ];
+        // 已验证香港能在同一响应中覆盖全区六店；其他地区保留原查询范围。
+        if region.locale == "zh_HK" {
+            pairs.push(("searchNearby".to_string(), "true".to_string()));
+        }
         pairs.extend(
             parts
                 .iter()
@@ -592,13 +606,42 @@ AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{FALLBACK_CHROMIUM_MAJOR}.0.0.0 Sa
 /// 可交给核心监控引擎的 Chromium 查询器。
 #[derive(Debug, Clone)]
 pub struct AppleChromiumFetcher {
-    session: Arc<Mutex<Option<ChromiumSession>>>,
+    state: Arc<Mutex<QueryState>>,
+}
+
+type PickupCacheKey = (&'static str, Vec<String>, Option<DeliveryRegion>);
+
+#[derive(Debug, Default)]
+struct QueryState {
+    session: Option<ChromiumSession>,
+    /// 只在当前轮次内共用同地区、同配置的附近门店响应。
+    pickup_cache: HashMap<PickupCacheKey, String>,
+    /// 独立于浏览器生命周期；销毁会话和开始下一轮都不能取消冷却。
+    cooldowns: HashMap<&'static str, Instant>,
+}
+
+impl QueryState {
+    fn record_failure(&mut self, region: &Region, error: &ApiError) {
+        if matches!(error, ApiError::Blocked(_) | ApiError::RateLimited(_)) {
+            self.cooldowns
+                .insert(region.locale, Instant::now() + REGION_COOLDOWN);
+            self.pickup_cache.retain(|key, _| key.0 != region.locale);
+            eprintln!(
+                "{}地区统一冷却 {} 秒：{error}",
+                region.title,
+                REGION_COOLDOWN.as_secs()
+            );
+        }
+        if matches!(error, ApiError::Blocked(_) | ApiError::Transport(_)) {
+            self.session = None;
+        }
+    }
 }
 
 impl AppleChromiumFetcher {
     pub fn new() -> Self {
         Self {
-            session: Arc::new(Mutex::new(None)),
+            state: Arc::new(Mutex::new(QueryState::default())),
         }
     }
 
@@ -630,11 +673,37 @@ impl AppleChromiumFetcher {
 
         // 一把锁覆盖整个浏览器命令往返。监控引擎可以并发调多个门店，但同一个
         // DevTools 连接与 Apple 会话必须串行使用，避免请求突发再次触发 541。
-        let mut guard = self.session.lock().await;
-        if guard.is_none() {
-            *guard = Some(ChromiumSession::start().await?);
+        parts.sort_unstable();
+        parts.dedup();
+        let reuse_nearby =
+            region.locale == "zh_HK" && targets.iter().all(|target| target.kit_part.is_none());
+        let key = (region.locale, parts.clone(), delivery_region.cloned());
+        let mut guard = self.state.lock().await;
+        if let Some(until) = guard.cooldowns.get(region.locale) {
+            let remaining = until.saturating_duration_since(Instant::now());
+            if !remaining.is_zero() {
+                return Err(ApiError::Blocked(format!(
+                    "{}地区统一冷却中，约 {} 秒后重试；当前未向 Apple 发请求",
+                    region.title,
+                    remaining.as_secs() + 1
+                )));
+            }
+        }
+        guard.cooldowns.remove(region.locale);
+        if reuse_nearby
+            && let Some(body) = guard.pickup_cache.get(&key)
+            && let Ok(availability) = parse_pickup_message(body.as_bytes(), store_number)
+            && parts
+                .iter()
+                .all(|part| availability.parts.contains_key(part))
+        {
+            return Ok(availability);
+        }
+        if guard.session.is_none() {
+            guard.session = Some(ChromiumSession::start().await?);
         }
         let fetched = guard
+            .session
             .as_mut()
             .expect("刚初始化的 Chromium 会话应当存在")
             .fetch(region, store_number, &parts, delivery_region)
@@ -642,12 +711,7 @@ impl AppleChromiumFetcher {
         let payload = match fetched {
             Ok(payload) => payload,
             Err(error) => {
-                // CDP 断连、命令超时或页面执行失败后，不再缓存这个失效会话。
-                // 保留原错误交给引擎处理，后续查询才重建，不在失败请求内重试。
-                // Apple 的 HTTP 限流和库存数据仍走下面原有的分类逻辑。
-                if matches!(error, ApiError::Transport(_)) {
-                    *guard = None;
-                }
+                guard.record_failure(region, &error);
                 return Err(error);
             }
         };
@@ -660,13 +724,19 @@ impl AppleChromiumFetcher {
                     .find(|byte| !byte.is_ascii_whitespace())
                     .is_some_and(|byte| *byte != b'{' && *byte != b'[')
                 {
-                    return Err(ApiError::Blocked("HTTP 200 但响应不是 JSON".into()));
+                    let error = ApiError::Blocked("HTTP 200 但响应不是 JSON".into());
+                    guard.record_failure(region, &error);
+                    return Err(error);
                 }
                 let mut availability = parse_pickup_message(bytes, store_number)?;
+                // Watch 的附加送货查询按门店执行，保持原来的处理路径。
+                if reuse_nearby {
+                    guard.pickup_cache.insert(key, payload.body.clone());
+                }
                 if let Some(location) = delivery_region {
-                    let mut reset_session = false;
                     for target in targets.iter().filter(|target| target.kit_part.is_some()) {
                         match guard
+                            .session
                             .as_mut()
                             .expect("查询期间 Chromium 会话应当存在")
                             .fetch_watch_delivery(region, target, location)
@@ -683,27 +753,32 @@ impl AppleChromiumFetcher {
                             Ok(None) => {}
                             Err(error) => {
                                 // 送货是附加信息，失败不能抹掉已经拿到的门店库存结论。
-                                // 保留取货响应里的粗略文案，下轮自动重试精确送货。
                                 eprintln!("Watch 送货查询失败（{}）：{error}", target.part_number);
-                                reset_session |=
-                                    matches!(error, ApiError::Blocked(_) | ApiError::Transport(_));
+                                guard.record_failure(region, &error);
+                                if matches!(
+                                    error,
+                                    ApiError::Blocked(_)
+                                        | ApiError::RateLimited(_)
+                                        | ApiError::Transport(_)
+                                ) {
+                                    break;
+                                }
                             }
                         }
-                    }
-                    if reset_session {
-                        *guard = None;
                     }
                 }
                 Ok(availability)
             }
             403 | 541 => {
-                // 当前浏览器会话已经被拒绝。直接销毁临时资料与进程；下一轮会用
-                // 全新会话重新握手，不拿失效 Cookie 反复撞接口。
-                *guard = None;
-                Err(ApiError::Blocked(format!("HTTP {}", payload.status)))
+                let error = ApiError::Blocked(format!("HTTP {}", payload.status));
+                guard.record_failure(region, &error);
+                Err(error)
             }
-            429 => Err(ApiError::RateLimited("HTTP 429".into())),
-            status if status >= 500 => Err(ApiError::RateLimited(format!("HTTP {status}"))),
+            429 | 500..=599 => {
+                let error = ApiError::RateLimited(format!("HTTP {}", payload.status));
+                guard.record_failure(region, &error);
+                Err(error)
+            }
             0 => Err(ApiError::Transport(
                 payload.body.chars().take(300).collect(),
             )),
@@ -713,6 +788,10 @@ impl AppleChromiumFetcher {
 }
 
 impl Fetcher for AppleChromiumFetcher {
+    async fn begin_cycle(&self) {
+        self.state.lock().await.pickup_cache.clear();
+    }
+
     async fn pickup_message(
         &self,
         region: &'static Region,
@@ -745,19 +824,30 @@ mod tests {
 
     /// 模拟浏览器的 CDP 边界，不启动 Chromium，也不访问 Apple。
     async fn cdp_fixture(response: Value) -> (AppleChromiumFetcher, tokio::task::JoinHandle<bool>) {
+        cdp_responses(vec![response]).await
+    }
+
+    async fn cdp_responses(
+        responses: Vec<Value>,
+    ) -> (AppleChromiumFetcher, tokio::task::JoinHandle<bool>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let peer = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
-            let request = socket.next().await.unwrap().unwrap();
-            let request: Value = serde_json::from_str(request.to_text().unwrap()).unwrap();
-            let mut response = response;
-            response["id"] = request["id"].clone();
-            socket
-                .send(Message::Text(response.to_string().into()))
-                .await
-                .unwrap();
+            for mut response in responses {
+                let request = tokio::time::timeout(Duration::from_secs(5), socket.next())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap();
+                let request: Value = serde_json::from_str(request.to_text().unwrap()).unwrap();
+                response["id"] = request["id"].clone();
+                socket
+                    .send(Message::Text(response.to_string().into()))
+                    .await
+                    .unwrap();
+            }
             // 观察浏览器一端的连接生命周期，不依赖查询器内部的 Option 状态。
             matches!(
                 tokio::time::timeout(Duration::from_millis(500), socket.next()).await,
@@ -780,10 +870,132 @@ mod tests {
         };
         (
             AppleChromiumFetcher {
-                session: Arc::new(Mutex::new(Some(session))),
+                state: Arc::new(Mutex::new(QueryState {
+                    session: Some(session),
+                    ..QueryState::default()
+                })),
             },
             peer,
         )
+    }
+
+    fn pickup_response(stores: &[&str], part: &str, display: &str) -> Value {
+        let stores: Vec<_> = stores
+            .iter()
+            .map(|store| {
+                json!({
+                    "storeNumber":store, "partsAvailability": {
+                        part: {"partNumber":part, "pickupDisplay":display}
+                    }
+                })
+            })
+            .collect();
+        json!({"result":{"result":{"value":{
+            "status":200, "body":json!({"body":{"stores":stores}}).to_string()
+        }}}})
+    }
+
+    #[tokio::test]
+    async fn nearby_stores_share_one_request_but_next_cycle_is_fresh() {
+        let stores = ["R428", "R673", "R610", "R409", "R499", "R485"];
+        let (fetcher, peer) = cdp_responses(vec![
+            pickup_response(&stores, "MJXQ4ZA/A", "available"),
+            pickup_response(&stores, "MJXQ4ZA/A", "unavailable"),
+        ])
+        .await;
+        fetcher.state.lock().await.session.as_mut().unwrap().locale = Some("zh_HK");
+        let region = region_by_locale("zh_HK").unwrap();
+        for in_stock in [true, false] {
+            fetcher.begin_cycle().await;
+            for store in stores {
+                let result = fetcher
+                    .pickup_message(region, store, &[test_target("MJXQ4ZA/A")], None)
+                    .await
+                    .unwrap();
+                assert_eq!(result.store_number, store);
+                assert_eq!(
+                    result.parts["MJXQ4ZA/A"].availability.is_in_stock(),
+                    in_stock
+                );
+            }
+        }
+        assert!(
+            !peer.await.unwrap(),
+            "同一轮发了额外请求或关闭了仍有效的会话"
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_store_or_different_product_falls_back_to_a_real_request() {
+        let (fetcher, peer) = cdp_responses(vec![
+            pickup_response(&["R390"], "one", "available"),
+            pickup_response(&["R683"], "one", "unavailable"),
+            pickup_response(&["R683"], "two", "available"),
+        ])
+        .await;
+        fetcher.state.lock().await.session.as_mut().unwrap().locale = Some("zh_HK");
+        let region = region_by_locale("zh_HK").unwrap();
+        for (store, part, in_stock) in [
+            ("R390", "one", true),
+            ("R683", "one", false),
+            ("R683", "two", true),
+        ] {
+            let result = fetcher
+                .pickup_message(region, store, &[test_target(part)], None)
+                .await
+                .unwrap();
+            assert_eq!(result.store_number, store);
+            assert_eq!(result.parts[part].availability.is_in_stock(), in_stock);
+        }
+        assert!(!peer.await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn cooldown_is_shared_across_stores_and_cycles_without_extending_itself() {
+        let (fetcher, peer) = cdp_responses(vec![
+            json!({"result":{"result":{"value":{"status":429,"body":"{}"}}}}),
+            pickup_response(&["R390"], "one", "unavailable"),
+        ])
+        .await;
+        let region = region_by_locale("zh_CN").unwrap();
+        let target = test_target("one");
+        assert!(matches!(
+            fetcher
+                .pickup_message(region, "R390", std::slice::from_ref(&target), None)
+                .await,
+            Err(ApiError::RateLimited(_))
+        ));
+        let deadline = fetcher.state.lock().await.cooldowns[region.locale];
+        for _ in 0..2 {
+            fetcher.begin_cycle().await;
+            for store in ["R390", "R683", "R581", "R401", "R705", "R359"] {
+                let result = fetcher
+                    .clone()
+                    .pickup_message(region, store, std::slice::from_ref(&target), None)
+                    .await;
+                assert!(
+                    matches!(result, Err(ApiError::Blocked(ref message)) if message.contains("统一冷却"))
+                );
+            }
+        }
+        {
+            let mut state = fetcher.state.lock().await;
+            assert_eq!(state.cooldowns[region.locale], deadline);
+            state
+                .cooldowns
+                .insert(region.locale, Instant::now() - Duration::from_secs(1));
+            // 香港仍在冷却，不应阻止中国大陆恢复查询。
+            state
+                .cooldowns
+                .insert("zh_HK", Instant::now() + REGION_COOLDOWN);
+        }
+        assert!(
+            fetcher
+                .pickup_message(region, "R390", &[target], None)
+                .await
+                .is_ok()
+        );
+        assert!(!peer.await.unwrap());
     }
 
     #[tokio::test]
@@ -1023,6 +1235,38 @@ mod tests {
             message.contains("2026/"),
             "应为精确日期而不是周范围：{message}"
         );
+    }
+
+    #[tokio::test]
+    #[ignore = "现场只读诊断，需要本机 Chromium 与 Apple 官网网络"]
+    async fn hk_nearby_store_coverage() {
+        let region = region_by_locale("zh_HK").unwrap();
+        let mut session = ChromiumSession::start().await.unwrap();
+        let payload = session
+            .fetch(region, "R428", &["MJXQ4ZA/A".to_string()], None)
+            .await
+            .unwrap();
+        println!("Hong Kong response HTTP {}", payload.status);
+        assert_eq!(payload.status, 200);
+        let value: Value = serde_json::from_str(&payload.body).unwrap();
+        let stores = value
+            .pointer("/body/content/pickupMessage/stores")
+            .or_else(|| value.pointer("/body/stores"))
+            .and_then(Value::as_array)
+            .unwrap();
+        let ids: Vec<_> = stores
+            .iter()
+            .filter_map(|s| s["storeNumber"].as_str())
+            .collect();
+        println!(
+            "Returned store IDs: {ids:?}; body bytes: {}",
+            payload.body.len()
+        );
+        for store in ["R428", "R673", "R610", "R409", "R499", "R485"] {
+            let result = parse_pickup_message(payload.body.as_bytes(), store);
+            println!("{store}: {result:?}");
+            assert!(result.is_ok(), "missing Hong Kong store {store}");
+        }
     }
 
     #[tokio::test]

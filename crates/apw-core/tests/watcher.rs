@@ -21,6 +21,7 @@ type Responder =
 #[derive(Clone)]
 struct FakeFetcher {
     calls: Arc<AtomicUsize>,
+    cycles: Arc<AtomicUsize>,
     /// 同一时刻在飞的查询数峰值。只盯一个门店时，一条循环任何时候最多一次在飞，
     /// 峰值超过 1 就只能是同时存在两条循环。
     in_flight: Arc<AtomicUsize>,
@@ -40,6 +41,7 @@ impl FakeFetcher {
     ) -> Self {
         Self {
             calls: Arc::new(AtomicUsize::new(0)),
+            cycles: Arc::new(AtomicUsize::new(0)),
             in_flight: Arc::new(AtomicUsize::new(0)),
             peak: Arc::new(AtomicUsize::new(0)),
             seen_parts: Arc::new(Mutex::new(Vec::new())),
@@ -58,6 +60,10 @@ impl FakeFetcher {
 }
 
 impl Fetcher for FakeFetcher {
+    async fn begin_cycle(&self) {
+        self.cycles.fetch_add(1, Ordering::SeqCst);
+    }
+
     async fn pickup_message(
         &self,
         _region: &'static Region,
@@ -255,6 +261,10 @@ async fn 每轮都会报告开始与完成即使库存没变() {
     let first = wait_cycle(&mut rx).await;
     let second = wait_cycle(&mut rx).await;
     w.stop().await;
+    assert!(
+        fake.cycles.load(Ordering::SeqCst) >= 2,
+        "每轮都必须通知查询器清除旧库存缓存"
+    );
 
     assert!(first.iter().any(|event| matches!(
         event,

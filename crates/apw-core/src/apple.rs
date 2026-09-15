@@ -455,6 +455,11 @@ fn looks_like_json(content_type: &str, body: &[u8]) -> bool {
 /// 用泛型约束而不是 trait object：async fn in trait 在泛型位置可以直接写，
 /// 做成 `dyn` 还得引第三方宏来装箱 future，而引擎只需要一个具体实现，不值得。
 pub trait Fetcher: Clone + Send + Sync + 'static {
+    /// 新轮次开始时丢弃上轮库存缓存，避免把旧有货结果当作新结果提醒。
+    fn begin_cycle(&self) -> impl std::future::Future<Output = ()> + Send {
+        async {}
+    }
+
     fn pickup_message(
         &self,
         region: &'static Region,
@@ -611,8 +616,7 @@ pub fn parse_pickup_message(raw: &[u8], want_store: &str) -> Result<StoreAvailab
         });
     }
 
-    // 指定了 store 参数时 Apple 只返回该门店，但仍按编号核对，
-    // 避免把别的门店的库存错认成目标门店的。
+    // 附近门店查询可能一次返回多家店，必须按编号提取目标门店。
     let matched = stores
         .iter()
         .find(|s| s.store_number == want_store)

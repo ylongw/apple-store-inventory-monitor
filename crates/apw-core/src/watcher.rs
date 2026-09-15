@@ -328,6 +328,7 @@ async fn run_queries<F: Fetcher>(
     concurrency: usize,
     delivery_region: Option<DeliveryRegion>,
 ) -> Vec<StoreOutcome> {
+    client.begin_cycle().await;
     let sem = Arc::new(Semaphore::new(concurrency.max(1)));
     let mut set = JoinSet::new();
 
